@@ -378,3 +378,83 @@ def test_confirm_rejects_unknown_damage(client):
     make_version(client, "G101", OLD_SEGMENTS, activate=True)
     response = client.post("/roads/NOPE/damages/D-001/confirm", json={"start_m": 0, "end_m": 500})
     assert response.status_code == 404
+
+
+def relocate(client, damage_no="D-001"):
+    """重新定位：输入与候选都被替换（候选变为 (200,900) 与 (1200,1900)）。"""
+    return locate(client, damage_no=damage_no, start_station=900, end_station=200, measured_length=700)
+
+
+def test_confirm_only_accepts_current_candidates_after_relocation(client):
+    """重新定位替换候选后，旧候选不能再被确认，最新定位状态原样保留。"""
+    make_road(client)
+    make_version(client, "G101", OLD_SEGMENTS, activate=True)
+    first = locate(client).json()
+    assert first["status"] == "needs_selection"
+    assert first["locate_seq"] == 1
+
+    second = relocate(client).json()
+    assert second["status"] == "needs_selection"
+    assert second["locate_seq"] == 2
+    assert [(c["start_m"], c["end_m"]) for c in second["candidates"]] == [
+        (200.0, 900.0),
+        (1200.0, 1900.0),
+    ]
+
+    # 旧定位的候选 (1000,1500) 已不在当前候选列表中，确认被拒绝。
+    stale = client.post("/roads/G101/damages/D-001/confirm", json={"start_m": 1000, "end_m": 1500})
+    assert stale.status_code == 422
+
+    # 最新定位状态未被确认请求破坏。
+    body = client.get("/roads/G101/damages/D-001").json()
+    assert body["status"] == "needs_selection"
+    assert body["locate_seq"] == 2
+    assert body["confirmed"] is None
+    assert [(c["start_m"], c["end_m"]) for c in body["candidates"]] == [
+        (200.0, 900.0),
+        (1200.0, 1900.0),
+    ]
+
+    # 当前候选仍可正常确认。
+    ok = client.post("/roads/G101/damages/D-001/confirm", json={"start_m": 200, "end_m": 900})
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["confirmed"]["start_m"] == 200
+
+
+def test_confirm_with_stale_locate_seq_returns_409(client):
+    """携带过期定位序号的确认返回 409 stale_location，并保留最新定位状态。"""
+    make_road(client)
+    make_version(client, "G101", OLD_SEGMENTS, activate=True)
+    assert locate(client).json()["locate_seq"] == 1
+    assert relocate(client).json()["locate_seq"] == 2
+
+    # 即使区段本身在新候选中，基于旧定位序号的确认也被拒绝。
+    stale = client.post(
+        "/roads/G101/damages/D-001/confirm",
+        json={"start_m": 200, "end_m": 900, "locate_seq": 1},
+    )
+    assert stale.status_code == 409
+    detail = stale.json()
+    assert detail["code"] == "stale_location"
+    assert detail["locate_seq"] == 2
+
+    body = client.get("/roads/G101/damages/D-001").json()
+    assert body["status"] == "needs_selection"
+    assert body["locate_seq"] == 2
+
+    ok = client.post(
+        "/roads/G101/damages/D-001/confirm",
+        json={"start_m": 200, "end_m": 900, "locate_seq": 2},
+    )
+    assert ok.status_code == 200, ok.text
+    assert ok.json()["status"] == "confirmed"
+
+
+def test_locate_seq_increments_on_each_relocation(client):
+    make_road(client)
+    make_version(client, "G101", OLD_SEGMENTS, activate=True)
+    assert locate(client).json()["locate_seq"] == 1
+    # 无解重定位（pending_survey）同样推进序号。
+    assert locate(client, measured_length=1234).json()["locate_seq"] == 2
+    assert locate(client).json()["locate_seq"] == 3
+    assert client.get("/roads/G101/damages/D-001").json()["locate_seq"] == 3

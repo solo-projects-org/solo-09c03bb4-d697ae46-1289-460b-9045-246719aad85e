@@ -108,6 +108,8 @@ class Store:
                     confirmed_start_m     REAL,
                     confirmed_end_m       REAL,
                     located_at            TEXT NOT NULL,
+                    -- 定位序号：每次定位（含重新定位）+1，确认请求可据此做乐观并发校验
+                    locate_seq            INTEGER NOT NULL DEFAULT 1,
                     confirmed_at          TEXT,
                     PRIMARY KEY (chain_id, damage_no),
                     CHECK (
@@ -154,6 +156,17 @@ class Store:
                 END;
                 """
             )
+        self._migrate()
+
+    def _migrate(self) -> None:
+        """对既有库文件做就地迁移（新库在建表时已含新列）。"""
+
+        with _lock:
+            columns = {row["name"] for row in self._conn.execute("PRAGMA table_info(damages)")}
+            if "locate_seq" not in columns:
+                self._conn.execute(
+                    "ALTER TABLE damages ADD COLUMN locate_seq INTEGER NOT NULL DEFAULT 1"
+                )
 
     def close(self) -> None:
         self._conn.close()

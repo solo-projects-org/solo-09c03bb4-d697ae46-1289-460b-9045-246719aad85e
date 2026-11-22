@@ -96,6 +96,68 @@ def test_only_one_active_version(client):
     assert [v["status"] for v in versions] == ["superseded", "active"]
 
 
+def test_concurrent_relocate_and_confirm_stay_consistent(client):
+    """定位与确认交错并发：确认只可能接受当前定位结果。
+
+    不变式：无论请求如何交错，最终若病害被确认，确认区段一定属于当前
+    （最新一次）定位结果的候选列表；且重新定位永远不能把已确认记录改掉。
+    """
+    make_road(client)
+    make_version(client, "G101", OLD_SEGMENTS, activate=True)
+    first = client.post(
+        "/roads/G101/damages",
+        json={
+            "damage_no": "D-001",
+            "old_version": 1,
+            "start_station": 1000,
+            "end_station": 500,
+            "measured_length": 500,
+        },
+    )
+    assert first.status_code == 201
+    old_candidate = {"start_m": 1000, "end_m": 1500}  # 属于第一次定位的候选
+
+    def relocate(_):
+        # 重新定位：候选变为 (200,900) / (1200,1900)，不含旧候选。
+        return client.post(
+            "/roads/G101/damages",
+            json={
+                "damage_no": "D-001",
+                "old_version": 1,
+                "start_station": 900,
+                "end_station": 200,
+                "measured_length": 700,
+            },
+        ).status_code
+
+    def confirm_old(_):
+        return client.post(
+            "/roads/G101/damages/D-001/confirm", json=old_candidate
+        ).status_code
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        futures = []
+        for _ in range(12):
+            futures.append(pool.submit(relocate, None))
+            futures.append(pool.submit(confirm_old, None))
+        codes = [future.result() for future in futures]
+
+    # 每次请求都得到明确答复，没有 5xx。
+    assert set(codes) <= {200, 201, 409, 422}
+
+    body = client.get("/roads/G101/damages/D-001").json()
+    current_spans = {(c["start_m"], c["end_m"]) for c in body["candidates"]}
+    if body["status"] == "confirmed":
+        # 确认成功只可能发生在候选尚未被替换之前；此后所有重定位都被拒绝，
+        # 因此当前候选仍包含确认区段。
+        span = (body["confirmed"]["start_m"], body["confirmed"]["end_m"])
+        assert span in current_spans
+    else:
+        # 未确认：最新定位状态完整保留，且其候选不含旧候选。
+        assert body["status"] == "needs_selection"
+        assert (1000.0, 1500.0) not in current_spans
+
+
 def test_state_survives_new_store(client, tmp_path):
     make_road(client)
     make_version(client, "G101", OLD_SEGMENTS, activate=True)

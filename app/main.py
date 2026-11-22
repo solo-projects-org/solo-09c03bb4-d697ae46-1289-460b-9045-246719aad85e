@@ -86,11 +86,17 @@ class LocateIn(BaseModel):
 
 class ConfirmIn(BaseModel):
     model_config = ConfigDict(
-        json_schema_extra={"examples": [{"start_m": 1000, "end_m": 1500}]}
+        json_schema_extra={"examples": [{"start_m": 1000, "end_m": 1500, "locate_seq": 1}]}
     )
 
     start_m: float = Field(..., description="所选候选区段的实距起点（米）")
     end_m: float = Field(..., description="所选候选区段的实距止点（米）")
+    locate_seq: Optional[int] = Field(
+        None,
+        ge=1,
+        description="定位响应中的定位序号；提供时若与当前定位序号不一致，"
+        "说明病害已被重新定位，返回 409 stale_location",
+    )
 
 
 def _store() -> Store:
@@ -113,7 +119,10 @@ app = FastAPI(
         "**定位**：按旧表版号把两端桩号换算为实距（分段端点也参与换算），"
         "列出长度吻合的候选区段。无解 → `pending_survey`（待补测）；"
         "多候选 → `needs_selection`（须人工选定）。\n\n"
-        "**确认**：只能从候选列表中选择，确认后固定实距区段。\n\n"
+        "**确认**：只能从**当前**定位结果的候选列表中选择，确认后固定实距区段。"
+        "读取候选、匹配与写入在同一事务内完成；若确认期间病害被重新定位，"
+        "旧候选不再被接受（422），最新定位状态原样保留。请求可携带定位响应中的 "
+        "`locate_seq` 做乐观并发校验，序号不一致返回 409 `stale_location`。\n\n"
         "**供数**：沿现行表分段返回桩号，并注明所用表版号。\n\n"
         "**换版**：登记新版后激活；无论确认还是换版，生效后的现行表都必须完整"
         "覆盖全部已确认区段，有缺口返回 409 并列出病害号与缺失实距。"
@@ -205,7 +214,7 @@ def get_damage(road_id: str, damage_no: str, request: Request) -> dict[str, Any]
 
 @app.post("/roads/{road_id}/damages/{damage_no}/confirm", tags=["病害"])
 def confirm_damage(road_id: str, damage_no: str, body: ConfirmIn, request: Request) -> dict[str, Any]:
-    return _service(request).confirm(road_id, damage_no, body.start_m, body.end_m)
+    return _service(request).confirm(road_id, damage_no, body.start_m, body.end_m, body.locate_seq)
 
 
 @app.get("/roads/{road_id}/damages/{damage_no}/supply", tags=["病害"])

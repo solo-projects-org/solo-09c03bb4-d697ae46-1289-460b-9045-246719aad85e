@@ -309,8 +309,8 @@ class ChainService:
                     """
                     INSERT INTO damages (
                         chain_id, damage_no, status, old_version, start_station, end_station,
-                        measured_length, tolerance_m, candidates_json, located_at
-                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        measured_length, tolerance_m, candidates_json, located_at, locate_seq
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
                     """,
                     (
                         road_id,
@@ -330,7 +330,8 @@ class ChainService:
                     """
                     UPDATE damages SET
                         status = ?, old_version = ?, start_station = ?, end_station = ?,
-                        measured_length = ?, tolerance_m = ?, candidates_json = ?, located_at = ?
+                        measured_length = ?, tolerance_m = ?, candidates_json = ?, located_at = ?,
+                        locate_seq = locate_seq + 1
                     WHERE chain_id = ? AND damage_no = ?
                     """,
                     (
@@ -383,39 +384,61 @@ class ChainService:
         damage_no: str,
         start_m: float,
         end_m: float,
+        locate_seq: Optional[int] = None,
     ) -> dict[str, Any]:
+        """确认候选区段。
+
+        读取定位结果、匹配候选、覆盖校验与写入确认都在同一个写事务内完成
+        （``BEGIN IMMEDIATE`` 串行化），因此确认只可能接受**当前**（最新一次）
+        定位结果：若另一请求在此期间重新定位并替换了输入或候选，本请求在事务内
+        读到的就是新候选，旧候选不再匹配，确认被拒绝且最新定位状态原样保留。
+
+        调用方可携带定位响应中的 ``locate_seq`` 做乐观并发校验：与当前定位序号
+        不一致时返回 409 ``stale_location``，明确提示定位结果已更新。
+        """
+
         self.get_road(road_id)
-        row = self.store.query_one(
-            "SELECT * FROM damages WHERE chain_id = ? AND damage_no = ?",
-            (road_id, damage_no),
-        )
-        if row is None:
-            raise ServiceError(404, f"病害 {damage_no} 尚未定位")
-        if row["status"] == "confirmed":
-            raise ServiceError(409, f"病害 {damage_no} 已确认，确认记录不可修改")
-        if row["status"] == "pending_survey":
-            raise ServiceError(409, f"病害 {damage_no} 无候选区段，待补测，不能确认")
-
-        candidates = json.loads(row["candidates_json"])
-        matched = None
-        for cand in candidates:
-            if abs(cand["start_m"] - min(start_m, end_m)) <= POS_EPS and abs(
-                cand["end_m"] - max(start_m, end_m)
-            ) <= POS_EPS:
-                matched = cand
-                break
-        if matched is None:
-            raise ServiceError(422, "所选实距区段不在本病害的候选列表中")
-
-        span_start, span_end = matched["start_m"], matched["end_m"]
-
         with self.store.tx() as conn:
-            current = conn.execute(
-                "SELECT status FROM damages WHERE chain_id = ? AND damage_no = ?",
+            row = conn.execute(
+                "SELECT * FROM damages WHERE chain_id = ? AND damage_no = ?",
                 (road_id, damage_no),
             ).fetchone()
-            if current is None or current["status"] == "confirmed":
-                raise ServiceError(409, "病害确认状态已变化，请重新查询")
+            if row is None:
+                raise ServiceError(404, f"病害 {damage_no} 尚未定位")
+            if row["status"] == "confirmed":
+                raise ServiceError(409, f"病害 {damage_no} 已确认，确认记录不可修改")
+            if row["status"] == "pending_survey":
+                raise ServiceError(409, f"病害 {damage_no} 无候选区段，待补测，不能确认")
+            if locate_seq is not None and locate_seq != row["locate_seq"]:
+                raise ServiceError(
+                    409,
+                    {
+                        "code": "stale_location",
+                        "message": (
+                            f"病害 {damage_no} 的定位结果已更新（当前定位序号 "
+                            f"{row['locate_seq']}，请求基于 {locate_seq}），"
+                            "请查询最新候选后重新确认"
+                        ),
+                        "locate_seq": row["locate_seq"],
+                    },
+                )
+
+            candidates = json.loads(row["candidates_json"])
+            matched = None
+            for cand in candidates:
+                if abs(cand["start_m"] - min(start_m, end_m)) <= POS_EPS and abs(
+                    cand["end_m"] - max(start_m, end_m)
+                ) <= POS_EPS:
+                    matched = cand
+                    break
+            if matched is None:
+                raise ServiceError(
+                    422,
+                    f"所选实距区段不在病害 {damage_no} 的当前候选列表中；"
+                    "若病害刚被重新定位，请按最新候选重新确认",
+                )
+
+            span_start, span_end = matched["start_m"], matched["end_m"]
 
             active = conn.execute(
                 "SELECT version_no FROM chain_versions WHERE chain_id = ? AND status = 'active'",
@@ -473,6 +496,7 @@ class ChainService:
             "damage_no": damage_no,
             "status": row["status"],
             "located_at": row["located_at"],
+            "locate_seq": row["locate_seq"],
             "old_version": row["old_version"],
             "input": {
                 "start_station": row["start_station"],
