@@ -1,0 +1,15 @@
+services:
+  api:
+    build: .
+    image: chain-locator:latest
+    container_name: chain-locator
+    ports:
+      - "8000:8000"
+    environment:
+      CHAIN_DB_PATH: /data/chains.db
+    volumes:
+      - chain-data:/data
+    restart: unless-stopped
+
+volumes:
+  chain-data:
